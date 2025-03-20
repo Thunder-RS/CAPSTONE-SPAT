@@ -1,0 +1,51 @@
+// To get started, press Ctrl+Space to bring up the completion menu and view the available nodes.
+
+// You can also use the buttons in the sidebar to perform actions on nodes.
+// Actions currently available include:
+
+// * Enabling / disabling the node
+// * Adding the bus to a bus
+// * Removing the node
+// * Connecting ADC channels
+
+// For more help, browse the DeviceTree documentation at https://docs.zephyrproject.org/latest/guides/dts/index.html
+// You can also visit the nRF DeviceTree extension documentation at https://docs.nordicsemi.com/bundle/nrf-connect-vscode/page/guides/ncs_configure_app.html#devicetree-support-in-the-extension
+&i2c2 { // first determine which i2c node to connect to . 
+    compatible = "nordic,nrf-twim"; 
+    status = "okay";
+    pinctrl-0 = <&i2c2_default>; 
+	pinctrl-1 = <&i2c2_sleep>;
+    pinctrl-names = "default", "sleep";
+    clock-frequency = <I2C_BITRATE_STANDARD>;
+
+    bme280@77 {  // first device 
+        compatible = "bosch,bme280"; //Note is as BME280 from BOSCH
+        reg = <0x77>; //set register 
+        
+    };
+
+    apds9960@39 { //second device 
+        compatible = "avago,apds9960"; // note it as apds9960 from avago 
+        reg = <0x39>; // set register
+        int-gpios = <&gpio0 28 GPIO_ACTIVE_LOW>; // enable pin 28 for low to active sensor 
+        
+    };
+};
+// now pin declaration 
+&pinctrl {
+	/omit-if-no-ref/ i2c2_default: i2c2_default { 
+		group1  {
+			psels = <NRF_PSEL(TWIM_SCL, 0, 12)>, 
+					<NRF_PSEL(TWIM_SDA, 0, 13)>;
+		};
+	};
+
+	/omit-if-no-ref/ i2c2_sleep: i2c2_sleep {
+		group1  {
+			psels = <NRF_PSEL(TWIM_SCL, 0, 12)>,
+					<NRF_PSEL(TWIM_SDA, 0, 13)>;
+			low-power-enable;
+		};
+	};
+};
+
