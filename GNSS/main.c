@@ -3,233 +3,206 @@
 #include <nrf_modem_gnss.h>
 #include <dk_buttons_and_leds.h>
 #include <modem/lte_lc.h>
-#include <net/nrf_cloud.h>
-#include <net/nrf_cloud_location.h>
+#include <modem/nrf_modem_lib.h>
+#include <nrf_modem.h>
+#include <net/nrf_cloud_agnss.h>
+#include <stdio.h>
+#include <ncs_version.h>
 
-// Register the logging module
-LOG_MODULE_REGISTER(location_tracker, CONFIG_LOG_DEFAULT_LEVEL);
+LOG_MODULE_REGISTER(Lesson6_Exercise1, LOG_LEVEL_DBG);
 
-// Configuration for update interval (seconds)
-#define UPDATE_INTERVAL_SECONDS 60
+static struct nrf_modem_gnss_pvt_data_frame pvt_data;
+static int64_t gnss_start_time;
+static bool first_fix = false;
+static K_SEM_DEFINE(lte_connected, 0, 1);
 
-// Global flag for LTE connection status
-static volatile bool lte_connected = false;
+static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
+{
+    LOG_INF("Latitude:  %.6f", pvt_data->latitude);
+    LOG_INF("Longitude: %.6f", pvt_data->longitude);
+    LOG_INF("Altitude:  %.1f m", (double)pvt_data->altitude); // Explicit cast to double
+    LOG_INF("Time (UTC): %02d:%02d:%02d.%03d",
+            pvt_data->datetime.hour, pvt_data->datetime.minute,
+            pvt_data->datetime.seconds, pvt_data->datetime.ms);
+}
 
-// Callback for LTE connection events
+static void gnss_event_handler(int event)
+{
+    int err;
+    static struct nrf_modem_gnss_agnss_data_frame agnss_request;
+
+    switch (event) {
+    case NRF_MODEM_GNSS_EVT_PVT:
+        LOG_INF("Searching...");
+        int num_satellites = 0;
+        for (int i = 0; i < 12; i++) {
+            if (pvt_data.sv[i].signal != 0) {
+                LOG_INF("sv: %d, cn0: %d, signal: %d, elev: %d, azim: %d",
+                        pvt_data.sv[i].sv, pvt_data.sv[i].cn0, pvt_data.sv[i].signal,
+                        pvt_data.sv[i].elevation, pvt_data.sv[i].azimuth);
+                num_satellites++;
+            }
+        }
+        LOG_INF("Number of current satellites: %d", num_satellites);
+        err = nrf_modem_gnss_read(&pvt_data, sizeof(pvt_data), NRF_MODEM_GNSS_DATA_PVT);
+        if (err) {
+            LOG_ERR("nrf_modem_gnss_read failed, err %d", err);
+            return;
+        }
+        LOG_INF("PVT flags: 0x%08x", pvt_data.flags);
+        if (pvt_data.flags & NRF_MODEM_GNSS_PVT_FLAG_FIX_VALID) {
+            dk_set_led_on(DK_LED1);
+            print_fix_data(&pvt_data);
+            if (!first_fix) {
+                LOG_INF("Time to first fix: %.1f s",
+                        (k_uptime_get() - gnss_start_time) / 1000.0);
+                first_fix = true;
+            }
+        } else {
+            LOG_INF("No valid fix");
+        }
+        break;
+
+    case NRF_MODEM_GNSS_EVT_AGNSS_REQ:
+        LOG_INF("A-GNSS data needed");
+        err = nrf_modem_gnss_read(&agnss_request, sizeof(agnss_request), NRF_MODEM_GNSS_DATA_AGNSS_REQ);
+        if (err) {
+            LOG_ERR("Failed to read A-GNSS request, err %d", err);
+            return;
+        }
+        err = nrf_cloud_agnss_request(&agnss_request);
+        if (err) {
+            LOG_ERR("Failed to request A-GNSS data, err %d", err);
+            return;
+        }
+        LOG_INF("A-GNSS request sent to nRF Cloud");
+        break;
+
+    case NRF_MODEM_GNSS_EVT_FIX:
+        LOG_INF("GNSS fix event received");
+        break;
+
+    case NRF_MODEM_GNSS_EVT_NMEA:
+        LOG_INF("NMEA data received");
+        break;
+
+    case NRF_MODEM_GNSS_EVT_PERIODIC_WAKEUP:
+        LOG_INF("GNSS has woken up");
+        break;
+
+    case NRF_MODEM_GNSS_EVT_SLEEP_AFTER_FIX:
+        LOG_INF("GNSS enter sleep after fix");
+        break;
+
+    default:
+        LOG_INF("Unhandled GNSS event: %d", event);
+        break;
+    }
+}
+
 static void lte_handler(const struct lte_lc_evt *const evt)
 {
     switch (evt->type) {
-        case LTE_LC_EVT_NW_REG_SUCCESS:
-            LOG_INF("LTE network registration successful");
-            lte_connected = true;
-            dk_set_led_on(DK_LED1); // Indicate LTE connection
-            break;
-        case LTE_LC_EVT_NW_REG_FAILED:
-            LOG_ERR("LTE network registration failed");
-            lte_connected = false;
-            dk_set_led_off(DK_LED1);
-            break;
-        default:
-            break;
+    case LTE_LC_EVT_NW_REG_STATUS:
+        if (evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME ||
+            evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_ROAMING) {
+            LOG_INF("LTE network registered");
+            k_sem_give(&lte_connected);
+        }
+        break;
+
+    default:
+        break;
     }
 }
 
-// Callback for GPS fix data
-static void gnss_event_handler(uint32_t event)
-{
-    int err;
-    struct nrf_modem_gnss_pvt_data_frame pvt_data;
-
-    switch (event) {
-        case NRF_MODEM_GNSS_EVT_PVT:
-            // Read PVT (Position, Velocity, Time) data
-            err = nrf_modem_gnss_read(&pvt_data, sizeof(pvt_data), NRF_MODEM_GNSS_DATA_PVT);
-            if (err) {
-                LOG_ERR("Failed to read PVT data: %d", err);
-                return;
-            }
-
-            // Check if a valid fix is obtained
-            if (pvt_data.flags & NRF_MODEM_GNSS_PVT_FLAG_FIX_VALID) {
-                LOG_INF("GPS Fix: Lat=%.6f, Lon=%.6f, Alt=%.1f, Accuracy=%.1f",
-                        pvt_data.latitude, pvt_data.longitude,
-                        pvt_data.altitude, pvt_data.accuracy);
-
-                // Prepare location data for nRF Cloud
-                struct nrf_cloud_location_data location = {
-                    .latitude = pvt_data.latitude,
-                    .longitude = pvt_data.longitude,
-                    .accuracy = pvt_data.accuracy
-                };
-
-                // Send to nRF Cloud
-                err = nrf_cloud_location_send(&location);
-                if (err) {
-                    LOG_ERR("Failed to send location to nRF Cloud: %d", err);
-                } else {
-                    LOG_INF("Location sent to nRF Cloud");
-                    dk_set_led_on(DK_LED2); // Indicate successful send
-                    k_sleep(K_MSEC(500));
-                    dk_set_led_off(DK_LED2);
-                }
-
-                // Stop GNSS to save power
-                nrf_modem_gnss_stop();
-            }
-            break;
-        case NRF_MODEM_GNSS_EVT_FIX:
-            LOG_INF("GNSS fix obtained");
-            break;
-        case NRF_MODEM_GNSS_EVT_NMEA:
-            // Ignore NMEA data for simplicity
-            break;
-        case NRF_MODEM_GNSS_EVT_TIMEOUT:
-            LOG_WRN("GNSS timeout, no fix obtained");
-            nrf_modem_gnss_stop();
-            break;
-        default:
-            break;
-    }
-}
-
-// Initialize LTE modem
-static int modem_init(void)
+static int modem_configure(void)
 {
     int err;
 
-    // Initialize LTE modem
-    err = lte_lc_init();
+    err = nrf_modem_lib_init();
     if (err) {
-        LOG_ERR("Failed to initialize LTE modem: %d", err);
+        LOG_ERR("Failed to initialize modem library, err %d", err);
         return err;
     }
 
-    // Register LTE event handler
+    err = lte_lc_connect();
+    if (err) {
+        LOG_ERR("Failed to initialize LTE, err %d", err);
+        return err;
+    }
+
+    err = lte_lc_psm_req(true);
+    if (err) {
+        LOG_ERR("Failed to request PSM, err %d", err);
+    }
+
+    err = lte_lc_edrx_req(true);
+    if (err) {
+        LOG_ERR("Failed to request eDRX, err %d", err);
+    }
+
     lte_lc_register_handler(lte_handler);
-
-    // Connect to LTE network
-    err = lte_lc_connect_async(NULL);
+    err = lte_lc_connect();
     if (err) {
-        LOG_ERR("Failed to initiate LTE connection: %d", err);
+        LOG_ERR("Failed to connect to LTE, err %d", err);
         return err;
     }
 
     return 0;
 }
 
-// Initialize GNSS (GPS)
-static int gnss_init(void)
+int main(void)
 {
     int err;
 
-    // Initialize GNSS
-    err = nrf_modem_gnss_init();
-    if (err) {
-        LOG_ERR("Failed to initialize GNSS: %d", err);
-        return err;
-    }
-
-    // Set GNSS event handler
-    err = nrf_modem_gnss_event_handler_set(gnss_event_handler);
-    if (err) {
-        LOG_ERR("Failed to set GNSS event handler: %d", err);
-        return err;
-    }
-
-    // Configure GNSS for single-fix mode to save power
-    err = nrf_modem_gnss_fix_interval_set(1);
-    if (err) {
-        LOG_ERR("Failed to set GNSS fix interval: %d", err);
-        return err;
-    }
-
-    // Enable A-GPS for faster fixes
-    err = nrf_modem_gnss_use_case_set(NRF_MODEM_GNSS_USE_CASE_MULTIPLE_HOT_START);
-    if (err) {
-        LOG_ERR("Failed to set GNSS use case: %d", err);
-        return err;
-    }
-
-    return 0;
-}
-
-// Initialize nRF Cloud
-static int cloud_init(void)
-{
-    int err;
-
-    // Initialize nRF Cloud
-    err = nrf_cloud_init(NULL);
-    if (err) {
-        LOG_ERR("Failed to initialize nRF Cloud: %d", err);
-        return err;
-    }
-
-    // Connect to nRF Cloud
-    err = nrf_cloud_connect();
-    if (err) {
-        LOG_ERR("Failed to connect to nRF Cloud: %d", err);
-        return err;
-    }
-
-    return 0;
-}
-
-void main(void)
-{
-    int err;
-
-    // Initialize logging
-    LOG_INF("Starting nRF9161 Location Tracker");
-
-    // Initialize buttons and LEDs for status indication
     err = dk_leds_init();
     if (err) {
-        LOG_ERR("Failed to initialize LEDs: %d", err);
-        return;
+        LOG_ERR("Failed to initialize LEDs, err %d", err);
+        return err;
     }
 
-    // Initialize LTE modem
-    err = modem_init();
+    err = modem_configure();
     if (err) {
-        LOG_ERR("Modem initialization failed, exiting");
-        return;
+        LOG_ERR("Failed to configure modem, err %d", err);
+        return err;
     }
 
-    // Wait for LTE connection
-    while (!lte_connected) {
-        k_sleep(K_SECONDS(1));
-    }
+    LOG_INF("Waiting for LTE connection...");
+    k_sem_take(&lte_connected, K_FOREVER);
+    LOG_INF("LTE connected");
 
-    // Initialize nRF Cloud
-    err = cloud_init();
+    err = lte_lc_func_mode_set(LTE_LC_FUNC_MODE_ACTIVATE_GNSS);
     if (err) {
-        LOG_ERR("nRF Cloud initialization failed, exiting");
-        return;
+        LOG_ERR("Failed to activate GNSS, err %d", err);
+        return err;
     }
 
-    // Initialize GNSS
-    err = gnss_init();
+    err = nrf_modem_gnss_event_handler_set(gnss_event_handler);
     if (err) {
-        LOG_ERR("GNSS initialization failed, exiting");
-        return;
+        LOG_ERR("Failed to set GNSS event handler, err %d", err);
+        return err;
     }
 
-    // Main loop
-    while (1) {
-        if (lte_connected) {
-            // Start GNSS to acquire a fix
-            LOG_INF("Starting GNSS");
-            err = nrf_modem_gnss_start();
-            if (err) {
-                LOG_ERR("Failed to start GNSS: %d", err);
-            }
-
-            // Wait for the next update cycle
-            k_sleep(K_SECONDS(UPDATE_INTERVAL_SECONDS));
-        } else {
-            LOG_WRN("LTE not connected, retrying...");
-            k_sleep(K_SECONDS(5));
-        }
+    err = nrf_modem_gnss_fix_interval_set(1); // Set to 1 for faster fixes during testing
+    if (err) {
+        LOG_ERR("Failed to set GNSS fix interval, err %d", err);
+        return err;
     }
+
+    err = nrf_modem_gnss_fix_retry_set(10);
+    if (err) {
+        LOG_ERR("Failed to set GNSS fix retry, err %d", err);
+        return err;
+    }
+
+    err = nrf_modem_gnss_start();
+    if (err) {
+        LOG_ERR("Failed to start GNSS, err %d", err);
+        return err;
+    }
+
+    gnss_start_time = k_uptime_get();
+    LOG_INF("Starting GNSS");
+    return 0;
 }
