@@ -85,7 +85,7 @@ static int read_sensors(struct sensor_value *temp, struct sensor_value *hum, str
         err = sensor_sample_fetch(bme280);
         if (!err) break;
         LOG_ERR("BME280 fetch failed: %d, retries left: %d", err, retries);
-        k_sleep(K_MSEC₁00));
+        k_sleep(K_MSEC(100));
     }
     if (err) return err;
 
@@ -265,7 +265,7 @@ static void gnss_event_handler(int event)
     if (gnss_active && (k_uptime_get() - gnss_start_time) >= GNSS_TIMEOUT_MS) {
         LOG_INF("GNSS fix timeout after %d minutes", GNSS_TIMEOUT_MS / 60000);
         has_fix = false; // No fix obtained
-        k_sem_give(gnss_done); // Signal main loop to proceed
+        k_sem_give(&gnss_done); // Signal main loop to proceed
         return;
     }
 
@@ -292,7 +292,7 @@ static void gnss_event_handler(int event)
             dk_set_led_on(DK_LED1);
             print_fix_data(&pvt_data);
             has_fix = true;
-            k_sem_give(gnss_done); // Signal main loop to proceed
+            k_sem_give(&gnss_done); // Signal main loop to proceed
         } else {
             LOG_INF("No valid fix");
         }
@@ -332,7 +332,7 @@ static void lte_handler(const struct lte_lc_evt *const evt)
             evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_ROAMING) {
             LOG_INF("Connected to %s network",
                     evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME ? "home" : "roaming");
-            k_sem_give(lte_connected);
+            k_sem_give(&lte_connected);
         } else if (evt->nw_reg_status == LTE_LC_NW_REG_NOT_REGISTERED ||
                    evt->nw_reg_status == LTE_LC_NW_REG_SEARCHING) {
             LOG_INF("Network not registered or searching...");
@@ -419,7 +419,7 @@ static int connect_to_lte(void)
     int err;
     LOG_INF("Waiting for network...");
 
-    k_sem_reset(lte_connected);
+    k_sem_reset(&lte_connected);
     err = lte_lc_connect_async(lte_handler);
     if (err) {
         LOG_ERR("Failed to init modem, error: %d", err);
@@ -436,7 +436,7 @@ static int connect_to_lte(void)
         LOG_ERR("Failed to request eDRX, err %d", err);
     }
 
-    k_sem_take(lte_connected, K_FOREVER);
+    k_sem_take(&lte_connected, K_FOREVER);
     LOG_INF("Connected to LTE");
     return 0;
 }
@@ -465,7 +465,7 @@ static int setup_connection(void)
         .event_handler = cloud_event_handler,
     };
 
-    err = nrf_cloud_init(¶ms);
+    err = nrf_cloud_init(&params);
     if (err) {
         LOG_ERR("Failed to initialize nRF Cloud library: %d", err);
         return err;
@@ -524,7 +524,7 @@ static int attempt_gnss_fix(void)
 {
     int err;
 
-    k_sem_reset(gnss_done);
+    k_sem_reset(&gnss_done);
     err = setup_gnss();
     if (err) {
         LOG_ERR("Failed to set up GNSS, err %d", err);
@@ -532,7 +532,7 @@ static int attempt_gnss_fix(void)
     }
 
     // Wait for GNSS fix or timeout
-    k_sem_take(gnss_done, K_MSEC(GNSS_TIMEOUT_MS));
+    k_sem_take(&gnss_done, K_MSEC(GNSS_TIMEOUT_MS));
     LOG_INF("GNSS attempt completed (fix: %s)", has_fix ? "yes" : "no");
 
     // Stop GNSS to save power
