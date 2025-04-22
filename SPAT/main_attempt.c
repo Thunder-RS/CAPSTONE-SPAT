@@ -28,15 +28,10 @@ static int64_t gnss_start_time;
 static bool gnss_active = false;
 static bool has_fix = false;
 static int num_satellites = 0;
-
-#define GNSS_TIMEOUT_MS (5 * 60 * 1000) // 5 minutes
-#define SLEEP_DURATION_MS (20 * 60 * 1000) // 20 minutes
-#define LTE_MAX_RETRIES 3
-#define LTE_RETRY_DELAY_MS 5000
-
-#define LTE_TIMEOUT_MS 120000
-
-
+//#define GNSS_TIMEOUT_MS (5 * 60 * 1000) // 5 minutes
+//#define SLEEP_DURATION_MS (20 * 60 * 1000) // 20 minutes
+#define SLEEP_DURATION_MS ( 60 * 1000) // 20 minutes
+#define GNSS_TIMEOUT_MS ( 60 * 1000) // 5 minutes
 /* nRF Cloud device ID */
 static char device_id[NRF_CLOUD_CLIENT_ID_MAX_LEN + 1];
 
@@ -56,7 +51,7 @@ static void enter_sleep_mode(void)
 
     LOG_INF("Entering sleep mode");
     dk_set_led_off(DK_LED1); // Turn off LED to save power
-
+    /*
     // Stop GNSS
     if (gnss_active) {
         err = nrf_modem_gnss_stop();
@@ -78,7 +73,7 @@ static void enter_sleep_mode(void)
     if (err) {
         LOG_ERR("Failed to disconnect nRF Cloud, err %d", err);
     }
-
+    */
     // Enter sleep
     LOG_INF("Sleeping for %d minutes", SLEEP_DURATION_MS / 60000);
     k_msleep(SLEEP_DURATION_MS);
@@ -423,8 +418,6 @@ static int init(void)
 static int connect_to_lte(void)
 {
     int err;
- 
-
     LOG_INF("Waiting for network...");
 
     k_sem_reset(&lte_connected);
@@ -443,26 +436,20 @@ static int connect_to_lte(void)
     if (err) {
         LOG_ERR("Failed to request eDRX, err %d", err);
     }
-  
-    
+
     k_sem_take(&lte_connected, K_FOREVER);
     LOG_INF("Connected to LTE");
-    
-
     return 0;
 }
 
 static int setup_connection(void)
 {
     int err;
-    
+
     err = connect_to_lte();
     if (err) {
         LOG_ERR("Failed to connect to cellular network: %d", err);
         return err;
-    }
-    else {
-        LOG_INF("Connected to Cellular Network");
     }
 
     memset(device_id, 0, sizeof(device_id));
@@ -537,17 +524,6 @@ static int setup_gnss(void)
 static int attempt_gnss_fix(void)
 {
     int err;
-    int ret;
-    ret = nrf_cloud_agnss_request_all();
-    if (ret) {
-        LOG_ERR("A-GNSS request failed: %d", ret);
-    } else {
-        LOG_INF("A-GNSS data requested");
-    }
-    ret = nrf_modem_gnss_fix_interval_set(0); // Single-shot fix
-    if (ret) LOG_ERR("Set fix interval failed: %d", ret);
-    ret = nrf_modem_gnss_fix_retry_set(30); // More retries
-    if (ret) LOG_ERR("Set fix retry failed: %d", ret);
 
     k_sem_reset(&gnss_done);
     err = setup_gnss();
@@ -631,105 +607,28 @@ static bool cred_check(struct nrf_cloud_credentials_status *const cs)
     return (cs->ca && cs->prv_key && cs->client_cert);
 }
 
-static int check_modem_state(void) {
-        int ret = nrf_modem_is_initialized();
-        if (!ret) {
-            LOG_ERR("Modem not initialized");
-          
-            if (ret) {
-                LOG_ERR("Modem init failed: %d", ret);
-                return ret;
-            }
-            LOG_INF("Modem initialized");
-        }
-        return 0;
-    }
-
-static int connect_to_lte_with_retries(void) {
-        int ret;
-    
-        for (int i = 0; i < LTE_MAX_RETRIES; i++) {
-            LOG_INF("LTE connect attempt %d/%d", i + 1, LTE_MAX_RETRIES);
-      
-            ret = connect_to_lte();
-            if (!ret) {
-                return 0;
-            }
-    
-            LOG_ERR("LTE connect failed: %d", ret);
-            lte_lc_offline();
-            k_msleep(LTE_RETRY_DELAY_MS);
-        }
-    
-        LOG_ERR("LTE connection failed after %d retries", LTE_MAX_RETRIES);
-        return -ECONNREFUSED;
-}
-
-
-
-static int wake_from_sleep(void) {
-        int ret;
-    
-        LOG_INF("Waking from sleep");
-    
-        ret = check_modem_state();
-        if (ret) {
-            LOG_ERR("Modem state check failed: %d", ret);
-            return ret;
-        }
-    
-        ret = lte_lc_connect();
-        if (ret) {
-            LOG_ERR("LTE init failed: %d", ret);
-            return ret;
-        }
-    
-        ret = connect_to_lte_with_retries();
-        if (ret) {
-            LOG_ERR("LTE reconnect failed: %d", ret);
-            return ret;
-        }
-    
-        LOG_INF("Wake-up and LTE connection successful");
-        return 0;
-    }
-
-
-
 int main(void)
 {
     int err;
-    int ret;
     struct nrf_cloud_credentials_status cs = {0};
     struct sensor_value temp, hum, light;
     struct modem_param_info modem_info;
 
     LOG_INF("Starting nRF9161 Sensor and GNSS Cloud Application");
+
     err = setup();
     if (err) {
         LOG_ERR("Setup failed, stopping.");
         return err;
     }
-       
+
     if (!cred_check(&cs)) {
         LOG_ERR("Credentials check failed, stopping.");
         return -EACCES;
     }
-   
-    while (1) {
-      
-        ret = wake_from_sleep();
-        if (ret) {
-            LOG_ERR("Wake-up and LTE reconnect failed: %d", ret);
-            // Option 1: Continue to next cycle
-            LOG_INF("Skipping to next cycle");
-            // Option 2: Reboot as last resort (uncomment if needed)
-            // LOG_ERR("Rebooting due to persistent failure");
-            // sys_reboot(SYS_REBOOT_COLD);
-        }
 
-    
-        // Attempt GNSS fix    
+    while (1) {
+        // Attempt GNSS fix
         err = attempt_gnss_fix();
         if (err) {
             LOG_ERR("GNSS attempt failed, continuing: %d", err);
@@ -761,7 +660,6 @@ int main(void)
             LOG_ERR("Sensor read failed");
         }
 
-
         // Send GNSS data (fix, partial, or none)
         err = send_gnss_to_cloud();
         if (err) {
@@ -773,16 +671,14 @@ int main(void)
             }
         }
 
-
         // Enter sleep mode
         enter_sleep_mode();
-
-        // Reconnect to nRF Cloud after waking
+        /*        // Reconnect to nRF Cloud after waking
         err = setup_connection();
         if (err) {
             LOG_ERR("Failed to reconnect after wake, continuing: %d", err);
         }
-
+            */
     }
     return 0;
 }
