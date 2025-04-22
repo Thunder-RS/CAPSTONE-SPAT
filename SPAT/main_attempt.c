@@ -1,6 +1,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/logging/log.h>
 #include <modem/lte_lc.h>
@@ -15,11 +16,33 @@
 
 LOG_MODULE_REGISTER(sensor_gnss_cloud, CONFIG_LOG_DEFAULT_LEVEL);
 K_SEM_DEFINE(lte_connected, 0, 1);
-K_SEM_DEFINE(gnss_done, 0, 1); // Signals GNSS attempt completion
+K_SEM_DEFINE(gnss_done, 0, 1);
 
-/* Sensor devices */
+/*  Sensor devices */
 const struct device *bme280 = DEVICE_DT_GET_ANY(bosch_bme280);
 const struct device *apds = DEVICE_DT_GET_ANY(avago_apds9960);
+
+/* ADC configuration */
+#define ADC_NODE DT_NODELABEL(adc)
+#define ADC_RESOLUTION 12
+#define NUM_CHANNELS   2
+#define BUFFER_SIZE    NUM_CHANNELS
+#define VDD_VOLTAGE    3.3f
+#define ADC_MAX        4095
+#define ADC_GAIN       (1.0f / 6.0f)
+#define ADC_REFERENCE  (VDD_VOLTAGE / 4.0f)
+#define ADC_FULL_SCALE (ADC_REFERENCE / ADC_GAIN) // 4.95V
+
+static const uint8_t adc_channels[NUM_CHANNELS] = {1, 2}; // AIN1, AIN2
+static __aligned(4) int16_t adc_sample_buffer[BUFFER_SIZE];
+static struct adc_channel_cfg adc_cfg[NUM_CHANNELS];
+static struct adc_sequence adc_sequence = {
+    .channels    = 0,
+    .buffer      = adc_sample_buffer,
+    .buffer_size = sizeof(adc_sample_buffer),
+    .resolution  = ADC_RESOLUTION,
+};
+static const struct device *adc_dev = DEVICE_DT_GET(ADC_NODE);
 
 /* GNSS data */
 static struct nrf_modem_gnss_pvt_data_frame pvt_data;
@@ -28,12 +51,102 @@ static int64_t gnss_start_time;
 static bool gnss_active = false;
 static bool has_fix = false;
 static int num_satellites = 0;
-//#define GNSS_TIMEOUT_MS (5 * 60 * 1000) // 5 minutes
-//#define SLEEP_DURATION_MS (20 * 60 * 1000) // 20 minutes
-#define SLEEP_DURATION_MS ( 60 * 1000) // 20 minutes
-#define GNSS_TIMEOUT_MS ( 60 * 1000) // 5 minutes
+#define SLEEP_DURATION_MS (60 * 1000) // 1 minute
+#define GNSS_TIMEOUT_MS (60 * 1000)   // 1 minute
+
 /* nRF Cloud device ID */
 static char device_id[NRF_CLOUD_CLIENT_ID_MAX_LEN + 1];
+
+static float convert_to_voltage(int16_t raw)
+{
+    return ((float)raw / ADC_MAX) * ADC_FULL_SCALE; // 4.95V full scale
+}
+
+static int setup_adc(void)
+{
+    if (!device_is_ready(adc_dev)) {
+        LOG_ERR("ADC device not ready");
+        return -ENODEV;
+    }
+
+    for (int i = 0; i < NUM_CHANNELS; i++) {
+        adc_cfg[i] = (struct adc_channel_cfg){
+            .gain             = ADC_GAIN_1_6,
+            .reference        = ADC_REF_VDD_1_4,
+            .acquisition_time = ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 10),
+            .channel_id       = adc_channels[i],
+        #ifdef CONFIG_ADC_CONFIGURABLE_INPUTS
+            .input_positive   = SAADC_CH_PSELP_PSELP_AnalogInput0 + adc_channels[i],
+        #endif
+        };
+
+        int err = adc_channel_setup(adc_dev, &adc_cfg[i]);
+        if (err) {
+            LOG_ERR("ADC channel %d setup failed: %d", adc_channels[i], err);
+            return err;
+        }
+        LOG_INF("ADC channel %d setup OK", adc_channels[i]);
+        adc_sequence.channels |= BIT(adc_channels[i]);
+    }
+    return 0;
+}
+
+static int read_adc(float *voltages)
+{
+    int err = adc_read(adc_dev, &adc_sequence);
+    if (err) {
+        LOG_ERR("ADC read failed: %d", err);
+        return err;
+    }
+
+    for (int i = 0; i < NUM_CHANNELS; i++) {
+        voltages[i] = convert_to_voltage(adc_sample_buffer[i]);
+        LOG_INF("AIN%d: raw = %d → voltage = %.3f V", adc_channels[i], adc_sample_buffer[i], (double)voltages[i]);
+    }
+    return 0;
+}
+
+static int send_adc_to_cloud(float *voltages)
+{
+    int ret;
+    cJSON *root;
+    char *json_str;
+
+    for (int i = 0; i < NUM_CHANNELS; i++) {
+        root = cJSON_CreateObject();
+        if (!root) {
+            LOG_ERR("Failed to create JSON object for ADC%d", i);
+            return -ENOMEM;
+        }
+        char app_id[8];
+        snprintf(app_id, sizeof(app_id), "ADC%d", i);
+        cJSON_AddStringToObject(root, "appId", app_id);
+        cJSON_AddNumberToObject(root, "data", voltages[i]);
+        cJSON_AddStringToObject(root, "messageType", "DATA");
+
+        json_str = cJSON_PrintUnformatted(root);
+        if (!json_str) {
+            LOG_ERR("Failed to create JSON string for ADC%d", i);
+            cJSON_Delete(root);
+            return -ENOMEM;
+        }
+        struct nrf_cloud_tx_data adc_msg = {
+            .data.ptr = json_str,
+            .data.len = strlen(json_str),
+            .qos = MQTT_QOS_1_AT_LEAST_ONCE,
+            .topic_type = NRF_CLOUD_TOPIC_MESSAGE
+        };
+        LOG_INF("Sending ADC%d: %s", i, json_str);
+        ret = nrf_cloud_send(&adc_msg);
+        cJSON_free(json_str);
+        cJSON_Delete(root);
+        if (ret) {
+            LOG_ERR("Failed to send ADC%d data: %d", i, ret);
+            return ret;
+        }
+    }
+    return 0;
+}
 
 static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
 {
@@ -47,35 +160,9 @@ static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
 
 static void enter_sleep_mode(void)
 {
-    int err;
-
     LOG_INF("Entering sleep mode");
-    dk_set_led_off(DK_LED1); // Turn off LED to save power
-    /*
-    // Stop GNSS
-    if (gnss_active) {
-        err = nrf_modem_gnss_stop();
-        if (err) {
-            LOG_ERR("Failed to stop GNSS, err %d", err);
-        } else {
-            gnss_active = false;
-        }
-    }
-
-    // Deactivate GNSS functional mode
-    err = lte_lc_func_mode_set(LTE_LC_FUNC_MODE_DEACTIVATE_GNSS);
-    if (err) {
-        LOG_ERR("Failed to deactivate GNSS, err %d", err);
-    }
-
-    // Disconnect from nRF Cloud to save power
-    err = nrf_cloud_disconnect();
-    if (err) {
-        LOG_ERR("Failed to disconnect nRF Cloud, err %d", err);
-    }
-    */
-    // Enter sleep
-    LOG_INF("Sleeping for %d minutes", SLEEP_DURATION_MS / 60000);
+    dk_set_led_off(DK_LED1);
+    LOG_INF("Sleeping for %d seconds", SLEEP_DURATION_MS / 1000);
     k_msleep(SLEEP_DURATION_MS);
 }
 
@@ -129,7 +216,6 @@ static int send_data_to_cloud(struct sensor_value *temp, struct sensor_value *hu
     cJSON_AddStringToObject(root, "appId", "TEMP");
     cJSON_AddNumberToObject(root, "data", sensor_value_to_double(temp));
     cJSON_AddStringToObject(root, "messageType", "DATA");
-    
     json_str = cJSON_PrintUnformatted(root);
     if (!json_str) {
         LOG_ERR("Failed to create JSON string");
@@ -137,10 +223,12 @@ static int send_data_to_cloud(struct sensor_value *temp, struct sensor_value *hu
         return -ENOMEM;
     }
     struct nrf_cloud_tx_data temp_msg = {
-        .data.ptr = json_str, .data.len = strlen(json_str),
-        .qos = MQTT_QOS_1_AT_LEAST_ONCE, .topic_type = NRF_CLOUD_TOPIC_MESSAGE
+        .data.ptr = json_str,
+        .data.len = strlen(json_str),
+        .qos = MQTT_QOS_1_AT_LEAST_ONCE,
+        .topic_type = NRF_CLOUD_TOPIC_MESSAGE
     };
-    LOG_INF("Sending temp: %s (value: %f)", json_str, sensor_value_to_double(temp));
+    LOG_INF("Sending temp: %s", json_str);
     ret = nrf_cloud_send(&temp_msg);
     cJSON_free(json_str);
     cJSON_Delete(root);
@@ -165,8 +253,10 @@ static int send_data_to_cloud(struct sensor_value *temp, struct sensor_value *hu
         return -ENOMEM;
     }
     struct nrf_cloud_tx_data hum_msg = {
-        .data.ptr = json_str, .data.len = strlen(json_str),
-        .qos = MQTT_QOS_1_AT_LEAST_ONCE, .topic_type = NRF_CLOUD_TOPIC_MESSAGE
+        .data.ptr = json_str,
+        .data.len = strlen(json_str),
+        .qos = MQTT_QOS_1_AT_LEAST_ONCE,
+        .topic_type = NRF_CLOUD_TOPIC_MESSAGE
     };
     LOG_INF("Sending humid: %s", json_str);
     ret = nrf_cloud_send(&hum_msg);
@@ -193,8 +283,10 @@ static int send_data_to_cloud(struct sensor_value *temp, struct sensor_value *hu
         return -ENOMEM;
     }
     struct nrf_cloud_tx_data light_msg = {
-        .data.ptr = json_str, .data.len = strlen(json_str),
-        .qos = MQTT_QOS_1_AT_LEAST_ONCE, .topic_type = NRF_CLOUD_TOPIC_MESSAGE
+        .data.ptr = json_str,
+        .data.len = strlen(json_str),
+        .qos = MQTT_QOS_1_AT_LEAST_ONCE,
+        .topic_type = NRF_CLOUD_TOPIC_MESSAGE
     };
     LOG_INF("Sending light: %s", json_str);
     ret = nrf_cloud_send(&light_msg);
@@ -244,8 +336,10 @@ static int send_gnss_to_cloud(void)
         return -ENOMEM;
     }
     struct nrf_cloud_tx_data gnss_msg = {
-        .data.ptr = json_str, .data.len = strlen(json_str),
-        .qos = MQTT_QOS_1_AT_LEAST_ONCE, .topic_type = NRF_CLOUD_TOPIC_MESSAGE
+        .data.ptr = json_str,
+        .data.len = strlen(json_str),
+        .qos = MQTT_QOS_1_AT_LEAST_ONCE,
+        .topic_type = NRF_CLOUD_TOPIC_MESSAGE
     };
     LOG_INF("Sending GNSS: %s", json_str);
     ret = nrf_cloud_send(&gnss_msg);
@@ -262,11 +356,10 @@ static void gnss_event_handler(int event)
 {
     int err;
 
-    // Check for GNSS timeout
     if (gnss_active && (k_uptime_get() - gnss_start_time) >= GNSS_TIMEOUT_MS) {
-        LOG_INF("GNSS fix timeout after %d minutes", GNSS_TIMEOUT_MS / 60000);
-        has_fix = false; // No fix obtained
-        k_sem_give(&gnss_done); // Signal main loop to proceed
+        LOG_INF("GNSS fix timeout after %d seconds", GNSS_TIMEOUT_MS / 1000);
+        has_fix = false;
+        k_sem_give(&gnss_done);
         return;
     }
 
@@ -293,7 +386,7 @@ static void gnss_event_handler(int event)
             dk_set_led_on(DK_LED1);
             print_fix_data(&pvt_data);
             has_fix = true;
-            k_sem_give(&gnss_done); // Signal main loop to proceed
+            k_sem_give(&gnss_done);
         } else {
             LOG_INF("No valid fix");
         }
@@ -532,11 +625,9 @@ static int attempt_gnss_fix(void)
         return err;
     }
 
-    // Wait for GNSS fix or timeout
     k_sem_take(&gnss_done, K_MSEC(GNSS_TIMEOUT_MS));
     LOG_INF("GNSS attempt completed (fix: %s)", has_fix ? "yes" : "no");
 
-    // Stop GNSS to save power
     if (gnss_active) {
         err = nrf_modem_gnss_stop();
         if (err) {
@@ -562,6 +653,12 @@ static int setup(void)
     err = setup_connection();
     if (err) {
         LOG_ERR("Connection set-up failed.");
+        return err;
+    }
+
+    err = setup_adc();
+    if (err) {
+        LOG_ERR("ADC setup failed.");
         return err;
     }
 
@@ -613,8 +710,9 @@ int main(void)
     struct nrf_cloud_credentials_status cs = {0};
     struct sensor_value temp, hum, light;
     struct modem_param_info modem_info;
+    float adc_voltages[NUM_CHANNELS];
 
-    LOG_INF("Starting nRF9161 Sensor and GNSS Cloud Application");
+    LOG_INF("Starting nRF9161 Sensor, GNSS, and ADC Cloud Application");
 
     err = setup();
     if (err) {
@@ -660,7 +758,22 @@ int main(void)
             LOG_ERR("Sensor read failed");
         }
 
-        // Send GNSS data (fix, partial, or none)
+        // Read and send ADC data
+        if (read_adc(adc_voltages) == 0) {
+            err = send_adc_to_cloud(adc_voltages);
+            if (err) {
+                LOG_ERR("ADC data send failed, attempting reconnect");
+                nrf_cloud_disconnect();
+                err = setup_connection();
+                if (err) {
+                    LOG_ERR("Reconnection failed, continuing: %d", err);
+                }
+            }
+        } else {
+            LOG_ERR("ADC read failed");
+        }
+
+        // Send GNSS data
         err = send_gnss_to_cloud();
         if (err) {
             LOG_ERR("GNSS data send failed, attempting reconnect");
@@ -673,12 +786,6 @@ int main(void)
 
         // Enter sleep mode
         enter_sleep_mode();
-        /*        // Reconnect to nRF Cloud after waking
-        err = setup_connection();
-        if (err) {
-            LOG_ERR("Failed to reconnect after wake, continuing: %d", err);
-        }
-            */
     }
     return 0;
 }
