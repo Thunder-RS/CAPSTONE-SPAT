@@ -15,14 +15,17 @@
 #include <nrf_modem_gnss.h>
 #include <dk_buttons_and_leds.h>
 #include <cJSON.h>
+#include <zephyr/drivers/rtc.h>
+#include <zephyr/pm/device.h>
 
-LOG_MODULE_REGISTER(sensor_gnss_cloud, CONFIG_LOG_DEFAULT_LEVEL);
+LOG_MODULE_REGISTER(SPAT, CONFIG_LOG_DEFAULT_LEVEL);
 K_SEM_DEFINE(lte_connected, 0, 1);
 K_SEM_DEFINE(gnss_done, 0, 1);
 
 /* Sensor devices */
 const struct device *bme280 = DEVICE_DT_GET_ANY(bosch_bme280);
 const struct device *apds = DEVICE_DT_GET_ANY(avago_apds9960);
+
 
 /* ADC configuration */
 #define ADC_NODE DT_NODELABEL(adc)
@@ -53,8 +56,8 @@ static int64_t gnss_start_time;
 static bool gnss_active = false;
 static bool has_fix = false;
 static int num_satellites = 0;
-#define SLEEP_DURATION_MS (60 * 1000) // 1 minute
-#define GNSS_TIMEOUT_MS (60 * 1000)   // 1 minute
+#define SLEEP_DURATION_MS (10 * 60 * 1000) // 10 minute
+#define GNSS_TIMEOUT_MS (5 * 60 * 1000)   // 5 minute
 
 /* Alert thresholds */
 #define TEMP_THRESHOLD   (double)  25.0  // °C
@@ -65,6 +68,18 @@ static int num_satellites = 0;
 
 /* nRF Cloud device ID */
 static char device_id[NRF_CLOUD_CLIENT_ID_MAX_LEN + 1];
+
+static void check_rtc(void)
+{
+    const struct device *rtc = DEVICE_DT_GET(DT_NODELABEL(rtc1));
+    if (!device_is_ready(rtc)) {
+        LOG_ERR("RTC device not ready");
+    } else {
+        LOG_INF("RTC device ready");
+    }
+}
+
+
 
 static float convert_to_voltage(int16_t raw)
 {
@@ -155,7 +170,7 @@ static int send_adc_to_cloud(float *voltages)
         }
     }
     return 0;
-    k_sleep(K_MSEC(2000));
+ 
 }
 
 // https://docs.nordicsemi.com/bundle/nrf-apis-latest/page/group_nrf_cloud_alert.html
@@ -180,7 +195,7 @@ static void check_and_send_alerts(struct sensor_value *temp, struct sensor_value
             LOG_INF("Sent temperature alert: %s (value: %.2f)", desc, (double)temp_val);
         }
     }
-    k_sleep(K_MSEC(1000));
+ 
 
     if ((double)hum_val > HUMID_THRESHOLD) {
         snprintf(desc, sizeof(desc), "Humidity exceeds %.1f%%", HUMID_THRESHOLD);
@@ -191,7 +206,7 @@ static void check_and_send_alerts(struct sensor_value *temp, struct sensor_value
             LOG_INF("Sent humidity alert: %s (value: %.2f)", desc, (double)hum_val);
         }
     }
-    k_sleep(K_MSEC(1000));
+
 
     if ((double)light_val > LIGHT_THRESHOLD) {
         snprintf(desc, sizeof(desc), "Light exceeds %.1f lux", LIGHT_THRESHOLD);
@@ -202,7 +217,7 @@ static void check_and_send_alerts(struct sensor_value *temp, struct sensor_value
             LOG_INF("Sent light alert: %s (value: %.2f)", desc, (double)light_val);
         }
     }
-    k_sleep(K_MSEC(1000));
+
 
     for (int i = 0; i < NUM_CHANNELS; i++) {
         if ((double)adc_voltages[i] > ADC_THRESHOLD) {
@@ -216,7 +231,7 @@ static void check_and_send_alerts(struct sensor_value *temp, struct sensor_value
             }
         }
     }
-    k_sleep(K_MSEC(2000));
+   
 }
 
 static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
@@ -231,10 +246,30 @@ static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
 
 static void enter_sleep_mode(void)
 {
-    LOG_INF("Entering sleep mode");
+    LOG_INF("Entering System OFF mode for %d seconds", SLEEP_DURATION_MS / 1000);
     dk_set_led_off(DK_LED1);
-    LOG_INF("Sleeping for %d seconds", SLEEP_DURATION_MS / 1000);
-    k_msleep(SLEEP_DURATION_MS);
+
+    const struct device *rtc = DEVICE_DT_GET(DT_NODELABEL(rtc1));
+    if (!device_is_ready(rtc)) {
+        LOG_ERR("RTC not ready, falling back to k_msleep");
+        k_msleep(SLEEP_DURATION_MS);
+        return;
+    }
+
+    /* Configure RTC alarm for 10 minutes (600 seconds) */
+    struct rtc_time alarm_time = {0};
+    alarm_time.tm_sec = (SLEEP_DURATION_MS / 1000) % 60;
+    alarm_time.tm_min = (SLEEP_DURATION_MS / 1000) / 60;
+    uint16_t alarm_mask = RTC_ALARM_TIME_MASK_SECOND | RTC_ALARM_TIME_MASK_MINUTE;
+    uint16_t alarm_id = 0; /* Use alarm ID 0 */
+
+    int err = rtc_alarm_set_time(rtc, alarm_id, alarm_mask, &alarm_time);
+    if (err) {
+        LOG_ERR("Failed to set RTC alarm: %d", err);
+        k_msleep(SLEEP_DURATION_MS);
+        return;
+    }
+
 }
 
 static int read_sensors(struct sensor_value *temp, struct sensor_value *hum, struct sensor_value *light)
@@ -367,7 +402,7 @@ static int send_data_to_cloud(struct sensor_value *temp, struct sensor_value *hu
         LOG_ERR("Failed to send light data: %d", ret);
         return ret;
     }
-    k_sleep(K_MSEC(1000));
+    
     return 0;
 }
 
@@ -486,7 +521,7 @@ static void gnss_event_handler(int event)
         LOG_INF("Unhandled GNSS event: %d", event);
         break;
     }
-    k_sleep(K_MSEC(1000));
+   
 }
 
 static void lte_handler(const struct lte_lc_evt *const evt)
@@ -557,7 +592,7 @@ static void cloud_event_handler(const struct nrf_cloud_evt *evt)
 static int init(void)
 {
     int err;
-
+    check_rtc(); /* Verify RTC readiness */
     err = nrf_modem_lib_init();
     if (err) {
         LOG_ERR("Failed to initialize modem library: 0x%X", err);
@@ -740,7 +775,7 @@ static int setup(void)
             break;
         }
         LOG_ERR("Sensors not ready, retries left: %d", retries);
-        k_sleep(K_MSEC(1000));
+  
     }
     if (!device_is_ready(bme280)) {
         LOG_ERR("BME280 device is not ready, stopping");
@@ -811,7 +846,7 @@ int main(void)
             LOG_INF("Signal strength: %d dBm", modem_info.network.rsrp.value);
         } else {
             LOG_WRN("Failed to get modem info: %d (continuing)", err);
-            k_sleep(K_MSEC(1000));
+           
         }
         
         // Send GNSS data
