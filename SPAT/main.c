@@ -1,4 +1,10 @@
+/* This code is for the Draper Sponsored Capstone Project for 2024-2025 UMass Lowell Academic Year
+   This code is the final incomplete version excluding the RTC experimental code that unfortunately couldn't be finished to replace the function k_msleep or the serial communication 
+   which works in a separate file but was not integrated in time for the SIM card that was used for development had expired. */
 
+
+
+/* All necessary header files */
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
@@ -16,9 +22,14 @@
 #include <dk_buttons_and_leds.h>
 #include <cJSON.h>
 
-LOG_MODULE_REGISTER(sensor_gnss_cloud, CONFIG_LOG_DEFAULT_LEVEL);
+/* Define LOG REGSTER with name and LOG Level */
+LOG_MODULE_REGISTER(SPAT, CONFIG_LOG_DEFAULT_LEVEL);
+
+
+/* Definitions for LTE and GNSS from Nordic Example Codes. Specifically */
 K_SEM_DEFINE(lte_connected, 0, 1);
 K_SEM_DEFINE(gnss_done, 0, 1);
+
 
 /* Sensor devices */
 const struct device *bme280 = DEVICE_DT_GET_ANY(bosch_bme280);
@@ -66,11 +77,14 @@ static int num_satellites = 0;
 /* nRF Cloud device ID */
 static char device_id[NRF_CLOUD_CLIENT_ID_MAX_LEN + 1];
 
+/* Convert read raw data rom ADC to readable voltage using scale */
 static float convert_to_voltage(int16_t raw)
 {
     return ((float)raw / ADC_MAX) * ADC_FULL_SCALE; // 4.95V full scale
 }
 
+
+/* Set up ADC and verify functionality */
 static int setup_adc(void)
 {
     if (!device_is_ready(adc_dev)) {
@@ -100,6 +114,7 @@ static int setup_adc(void)
     return 0;
 }
 
+/* Read ADC input for voltages to pointer voltages and return */
 static int read_adc(float *voltages)
 {
     int err = adc_read(adc_dev, &adc_sequence);
@@ -115,38 +130,48 @@ static int read_adc(float *voltages)
     return 0;
 }
 
+/* Send ADC data to cloud */
 static int send_adc_to_cloud(float *voltages)
 {
+    /* Variables for JSON package and error checking */
     int ret;
     cJSON *root;
     char *json_str;
-
+    
+    /* For amount of channels utilized create a JSON object */
     for (int i = 0; i < NUM_CHANNELS; i++) {
         root = cJSON_CreateObject();
         if (!root) {
             LOG_ERR("Failed to create JSON object for ADC%d", i);
             return -ENOMEM;
         }
+         /* Add the following information to the JSON message */
         char app_id[8];
-        snprintf(app_id, sizeof(app_id), "ADC%d", i);
+        snprintf(app_id, sizeof(app_id), "ADC%d", i); // Numerical value 
         cJSON_AddStringToObject(root, "appId", app_id);
         cJSON_AddNumberToObject(root, "data", voltages[i]);
-        cJSON_AddStringToObject(root, "messageType", "DATA");
+        cJSON_AddStringToObject(root, "messageType", "DATA");  // Message type
 
+         /* Combine JSON Message */
         json_str = cJSON_PrintUnformatted(root);
         if (!json_str) {
             LOG_ERR("Failed to create JSON string for ADC%d", i);
             cJSON_Delete(root);
             return -ENOMEM;
         }
+        
+        /* Create message to transmit */
         struct nrf_cloud_tx_data adc_msg = {
             .data.ptr = json_str,
             .data.len = strlen(json_str),
             .qos = MQTT_QOS_1_AT_LEAST_ONCE,
             .topic_type = NRF_CLOUD_TOPIC_MESSAGE
         };
+        /* Send message to serial to indicate */
         LOG_INF("Sending ADC%d: %s", i, json_str);
+         /*Send message to nRF Cloud */
         ret = nrf_cloud_send(&adc_msg);
+        /* Clear JSON String and delete */
         cJSON_free(json_str);
         cJSON_Delete(root);
         if (ret) {
@@ -158,19 +183,22 @@ static int send_adc_to_cloud(float *voltages)
  
 }
 
+/* Resources for Cloud Alerts */
 // https://docs.nordicsemi.com/bundle/nrf-apis-latest/page/group_nrf_cloud_alert.html
 // https://github.com/nrfconnect/sdk-nrf/blob/main/doc/nrf/libraries/networking/nrf_cloud_alert.rst#requirements
 // https://docs.nordicsemi.com/bundle/ncs-latest/page/nrf/libraries/networking/nrf_cloud_alert.html#samples_using_the_library
 
-
+/* This function is for checking values compared to thresholds and sending alerts to the cloud if surpassed */
 static void check_and_send_alerts(struct sensor_value *temp, struct sensor_value *hum, struct sensor_value *light, float *adc_voltages)
 {
+    /* Take the values from each sensor and store in new variable */
     float temp_val = (float)sensor_value_to_double(temp);
     float hum_val = (float)sensor_value_to_double(hum);
     float light_val = (float)sensor_value_to_double(light);
     char desc[64];
     int ret;
 
+    /* If read value is above the threshold send an alert */
     if ((double)temp_val > TEMP_THRESHOLD) {
         snprintf(desc, sizeof(desc), "Temperature exceeds %.1f°C", TEMP_THRESHOLD);
         ret = nrf_cloud_alert_send(ALERT_TYPE_TEMPERATURE, temp_val, desc);
@@ -181,7 +209,7 @@ static void check_and_send_alerts(struct sensor_value *temp, struct sensor_value
         }
     }
  
-
+    /* If read value is above the threshold send an alert */
     if ((double)hum_val > HUMID_THRESHOLD) {
         snprintf(desc, sizeof(desc), "Humidity exceeds %.1f%%", HUMID_THRESHOLD);
         ret = nrf_cloud_alert_send(ALERT_TYPE_HUMIDITY, hum_val, desc);
@@ -192,7 +220,7 @@ static void check_and_send_alerts(struct sensor_value *temp, struct sensor_value
         }
     }
 
-
+    /* If read value is above the threshold send an alert */
     if ((double)light_val > LIGHT_THRESHOLD) {
         snprintf(desc, sizeof(desc), "Light exceeds %.1f lux", LIGHT_THRESHOLD);
         ret = nrf_cloud_alert_send(ALERT_TYPE_CUSTOM, light_val, desc);
@@ -203,7 +231,7 @@ static void check_and_send_alerts(struct sensor_value *temp, struct sensor_value
         }
     }
 
-
+    /* If read value is above the threshold send an alert */
     for (int i = 0; i < NUM_CHANNELS; i++) {
         if ((double)adc_voltages[i] > ADC_THRESHOLD) {
             snprintf(desc, sizeof(desc), "ADC%d voltage exceeds %.1fV", i, ADC_THRESHOLD);
@@ -219,6 +247,7 @@ static void check_and_send_alerts(struct sensor_value *temp, struct sensor_value
    
 }
 
+/* Function to print fix data from GNSS */
 static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
 {
     LOG_INF("Latitude:  %.6f", pvt_data->latitude);
@@ -229,6 +258,7 @@ static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
             pvt_data->datetime.seconds, pvt_data->datetime.ms);
 }
 
+/* Sleep function using k_msleep */
 static void enter_sleep_mode(void)
 {
     LOG_INF("Entering sleep mode");
@@ -237,8 +267,10 @@ static void enter_sleep_mode(void)
     k_msleep(SLEEP_DURATION_MS);
 }
 
+/* Function to read data from sensors */
 static int read_sensors(struct sensor_value *temp, struct sensor_value *hum, struct sensor_value *light)
 {
+    /* Attempt initial fetch for BME280 */
     int err, retries = 3;
     while (retries--) {
         err = sensor_sample_fetch(bme280);
@@ -247,23 +279,29 @@ static int read_sensors(struct sensor_value *temp, struct sensor_value *hum, str
         k_sleep(K_MSEC(100));
     }
     if (err) return err;
-
+    
+    /* Then retrieve temperature */
     err = sensor_channel_get(bme280, SENSOR_CHAN_AMBIENT_TEMP, temp);
     if (err) {
         LOG_ERR("BME280 temp get failed: %d", err);
         return err;
     }
+    
+    /* Then retrieve humidity */
     err = sensor_channel_get(bme280, SENSOR_CHAN_HUMIDITY, hum);
     if (err) {
         LOG_ERR("BME280 humidity get failed: %d", err);
         return err;
     }
-
+    
+    /* Next fetch from APDS9960 light sensor */
     err = sensor_sample_fetch(apds);
     if (err) {
         LOG_ERR("APDS9960 fetch failed: %d", err);
         return err;
     }
+    
+    /* Rettrieve data from sensor and store in variable */
     err = sensor_channel_get(apds, SENSOR_CHAN_LIGHT, light);
     if (err) {
         LOG_ERR("APDS9960 light get failed: %d", err);
@@ -272,6 +310,7 @@ static int read_sensors(struct sensor_value *temp, struct sensor_value *hum, str
     return 0;
 }
 
+/* Function to send enviromental data to cloud */
 static int send_data_to_cloud(struct sensor_value *temp, struct sensor_value *hum, struct sensor_value *light)
 {
     int ret;
@@ -370,7 +409,7 @@ static int send_data_to_cloud(struct sensor_value *temp, struct sensor_value *hu
     
     return 0;
 }
-
+/* Send GNSS data */
 static int send_gnss_to_cloud(void)
 {
     int ret;
@@ -422,7 +461,7 @@ static int send_gnss_to_cloud(void)
 
     return ret;
 }
-
+/* GNSS Event Handler, do not touch, unless to add more cases, this is directly from Nordic */
 static void gnss_event_handler(int event)
 {
     int err;
@@ -489,6 +528,7 @@ static void gnss_event_handler(int event)
    
 }
 
+/* LTE Handler, do not touch, unless to add more cases, this is directly from Nordic */
 static void lte_handler(const struct lte_lc_evt *const evt)
 {
     switch (evt->type) {
@@ -521,6 +561,7 @@ static void lte_handler(const struct lte_lc_evt *const evt)
     }
 }
 
+/* Also do not touch, unless to add more cases */
 static void cloud_event_handler(const struct nrf_cloud_evt *evt)
 {
     if (evt == NULL) {
@@ -554,6 +595,7 @@ static void cloud_event_handler(const struct nrf_cloud_evt *evt)
     }
 }
 
+/* Initalize Function, calls functions written prior to verify functionality or initilizes libraries */
 static int init(void)
 {
     int err;
@@ -581,18 +623,21 @@ static int init(void)
     return 0;
 }
 
+/* Attempt initial connection to LTE */
 static int connect_to_lte(void)
 {
     int err;
     LOG_INF("Waiting for network...");
-
+    /* Start connection */
     k_sem_reset(&lte_connected);
+    
+    /* Call to LTE event handler for errors or messages */
     err = lte_lc_connect_async(lte_handler);
     if (err) {
         LOG_ERR("Failed to init modem, error: %d", err);
         return err;
     }
-
+    
     err = lte_lc_psm_req(true);
     if (err) {
         LOG_ERR("Failed to request PSM, err %d", err);
@@ -602,30 +647,33 @@ static int connect_to_lte(void)
     if (err) {
         LOG_ERR("Failed to request eDRX, err %d", err);
     }
-
+    /* continue to establish connection till connection is established */
     k_sem_take(&lte_connected, K_FOREVER);
     LOG_INF("Connected to LTE");
     return 0;
 }
-
+/* Function to set up connection */ 
 static int setup_connection(void)
 {
     int err;
-
+    /* Call connect_to_lte() to establish LTE connection */ 
     err = connect_to_lte();
     if (err) {
         LOG_ERR("Failed to connect to cellular network: %d", err);
         return err;
     }
 
+    /* Determine device ID before attempting nRF Cloud connection */
     memset(device_id, 0, sizeof(device_id));
     err = nrf_cloud_client_id_get(device_id, sizeof(device_id));
     if (err) {
         LOG_ERR("Failed to get device ID, error: %d", err);
         return err;
     }
-    LOG_INF("Device ID: %s (length: %d)", device_id, strlen(device_id));
 
+    /* Print Device ID */ 
+    LOG_INF("Device ID: %s (length: %d)", device_id, strlen(device_id));
+    
     LOG_INF("Attempting initial nRF Cloud connection...");
     struct nrf_cloud_init_param params = {
         .client_id = device_id,
@@ -637,70 +685,74 @@ static int setup_connection(void)
         LOG_ERR("Failed to initialize nRF Cloud library: %d", err);
         return err;
     }
-
+    /* Attempt nRF Cloud Connection */ 
     err = nrf_cloud_connect();
     if (err) {
         LOG_ERR("Initial nRF Cloud connection failed: %d", err);
         return err;
     }
+    /* If successful, print message and return to main */
     LOG_INF("Connected to nRF Cloud");
     return 0;
 }
 
+/* Function for setting up GNSS, do not touch unless absolutely necessary */
 static int setup_gnss(void)
 {
     int err;
 
+    /* Enable LTE function for GNSS */ 
     err = lte_lc_func_mode_set(LTE_LC_FUNC_MODE_ACTIVATE_GNSS);
     if (err) {
         LOG_ERR("Failed to activate GNSS, err %d", err);
         return err;
     }
-
+    /* Call to GNSS event handler to stablish connection */ 
     err = nrf_modem_gnss_event_handler_set(gnss_event_handler);
     if (err) {
         LOG_ERR("Failed to set GNSS event handler, err %d", err);
         return err;
     }
 
+    /* Set fix interval - this time slot may need to be updated but for testing was set to 1, if needed increase the interval */ 
     err = nrf_modem_gnss_fix_interval_set(1);
     if (err) {
         LOG_ERR("Failed to set GNSS fix interval, err %d", err);
         return err;
     }
-
+    /* Set fix retry interval - this time slot may need to be updated but for testing was set to 10, if needed increase the interval */ 
     err = nrf_modem_gnss_fix_retry_set(10);
     if (err) {
         LOG_ERR("Failed to set GNSS fix retry, err %d", err);
         return err;
     }
-
+    /* Start modem for GNSS */
     err = nrf_modem_gnss_start();
     if (err) {
         LOG_ERR("Failed to start GNSS, err %d", err);
         return err;
     }
-
+    
     gnss_start_time = k_uptime_get();
     gnss_active = true;
     LOG_INF("GNSS started");
     return 0;
 }
-
+/* Function for attempting GNSS fix */ 
 static int attempt_gnss_fix(void)
 {
     int err;
-
+    /* Call setup_gnss() then continure if no errors */ 
     k_sem_reset(&gnss_done);
     err = setup_gnss();
     if (err) {
         LOG_ERR("Failed to set up GNSS, err %d", err);
         return err;
     }
-
+    /* Attempt GNSS fix while the GNSS Timeout interval hasn;t passed */
     k_sem_take(&gnss_done, K_MSEC(GNSS_TIMEOUT_MS));
     LOG_INF("GNSS attempt completed (fix: %s)", has_fix ? "yes" : "no");
-
+    /* Print message returning information about GNSS */
     if (gnss_active) {
         err = nrf_modem_gnss_stop();
         if (err) {
@@ -713,6 +765,7 @@ static int attempt_gnss_fix(void)
     return 0;
 }
 
+/* Set up function to call other functions for initalization of system on boot */
 static int setup(void)
 {
     int err, retries = 3;
@@ -753,6 +806,7 @@ static int setup(void)
     return 0;
 }
 
+/* Function to verify credentials before connecting to nRF Cloud */
 static bool cred_check(struct nrf_cloud_credentials_status *const cs)
 {
     int ret;
@@ -777,6 +831,7 @@ static bool cred_check(struct nrf_cloud_credentials_status *const cs)
     return (cs->ca && cs->prv_key && cs->client_cert);
 }
 
+/* Main loop */ 
 int main(void)
 {
     int err;
