@@ -1,4 +1,9 @@
+/* This code is for the Draper Sponsored Capstone Project for 2024-2025 UMass Lowell Academic Year
+   This code is the experimental RTC code that unfortunately couldn't be finished to replace the function k_msleep
+   in time for the SIM card that was used for development had expired. */
 
+
+/* All necessary header files */
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
@@ -18,7 +23,12 @@
 #include <zephyr/drivers/rtc.h>
 #include <zephyr/pm/device.h>
 
+
+
+/* Define LOG REGSTER with name and LOG Level */
 LOG_MODULE_REGISTER(SPAT, CONFIG_LOG_DEFAULT_LEVEL);
+
+/* Definitions for LTE and GNSS from Nordic Example Codes. Specifically */
 K_SEM_DEFINE(lte_connected, 0, 1);
 K_SEM_DEFINE(gnss_done, 0, 1);
 
@@ -69,9 +79,11 @@ static int num_satellites = 0;
 /* nRF Cloud device ID */
 static char device_id[NRF_CLOUD_CLIENT_ID_MAX_LEN + 1];
 
+
+/* Check to see if RTC0 is enabled and active, return error if false.*/
 static void check_rtc(void)
 {
-    const struct device *rtc = DEVICE_DT_GET(DT_NODELABEL(rtc1));
+    const struct device *rtc = DEVICE_DT_GET(DT_NODELABEL(rtc0));
     if (!device_is_ready(rtc)) {
         LOG_ERR("RTC device not ready");
     } else {
@@ -80,12 +92,13 @@ static void check_rtc(void)
 }
 
 
-
+/* Convert read raw data rom ADC to readable voltage using scale */
 static float convert_to_voltage(int16_t raw)
 {
     return ((float)raw / ADC_MAX) * ADC_FULL_SCALE; // 4.95V full scale
 }
 
+/* Set up ADC and verify functionality */
 static int setup_adc(void)
 {
     if (!device_is_ready(adc_dev)) {
@@ -114,7 +127,7 @@ static int setup_adc(void)
     }
     return 0;
 }
-
+/* Read ADC input for voltages to pointer voltages and return */
 static int read_adc(float *voltages)
 {
     int err = adc_read(adc_dev, &adc_sequence);
@@ -130,38 +143,47 @@ static int read_adc(float *voltages)
     return 0;
 }
 
+/* Send ADC data to cloud */
 static int send_adc_to_cloud(float *voltages)
 {
+    /* Variables for JSON package and error checking */
     int ret;
     cJSON *root;
     char *json_str;
 
+    /* For amount of channels utilized create a JSON object */
     for (int i = 0; i < NUM_CHANNELS; i++) {
         root = cJSON_CreateObject();
         if (!root) {
             LOG_ERR("Failed to create JSON object for ADC%d", i);
             return -ENOMEM;
         }
+        /* Add the following information to the JSON message */
         char app_id[8];
-        snprintf(app_id, sizeof(app_id), "ADC%d", i);
-        cJSON_AddStringToObject(root, "appId", app_id);
-        cJSON_AddNumberToObject(root, "data", voltages[i]);
-        cJSON_AddStringToObject(root, "messageType", "DATA");
+        snprintf(app_id, sizeof(app_id), "ADC%d", i); // Numerical value 
+        cJSON_AddStringToObject(root, "appId", app_id); 
+        cJSON_AddNumberToObject(root, "data", voltages[i]); 
+        cJSON_AddStringToObject(root, "messageType", "DATA"); // Message type
 
+        /* Combine JSON Message */
         json_str = cJSON_PrintUnformatted(root);
         if (!json_str) {
             LOG_ERR("Failed to create JSON string for ADC%d", i);
             cJSON_Delete(root);
             return -ENOMEM;
         }
+        /* Create message to transmit */
         struct nrf_cloud_tx_data adc_msg = {
             .data.ptr = json_str,
             .data.len = strlen(json_str),
             .qos = MQTT_QOS_1_AT_LEAST_ONCE,
             .topic_type = NRF_CLOUD_TOPIC_MESSAGE
         };
+        /* Send message to serial to indicate */
         LOG_INF("Sending ADC%d: %s", i, json_str);
+        /*Send message to nRF Cloud */
         ret = nrf_cloud_send(&adc_msg);
+        /* Clear JSON String and delete */
         cJSON_free(json_str);
         cJSON_Delete(root);
         if (ret) {
@@ -178,14 +200,16 @@ static int send_adc_to_cloud(float *voltages)
 // https://docs.nordicsemi.com/bundle/ncs-latest/page/nrf/libraries/networking/nrf_cloud_alert.html#samples_using_the_library
 
 
+/* This function is for checking values */
 static void check_and_send_alerts(struct sensor_value *temp, struct sensor_value *hum, struct sensor_value *light, float *adc_voltages)
 {
+    /* Take the values from each sensor and store in new variable */
     float temp_val = (float)sensor_value_to_double(temp);
     float hum_val = (float)sensor_value_to_double(hum);
     float light_val = (float)sensor_value_to_double(light);
     char desc[64];
     int ret;
-
+    /* If read value is above the threshold send an alert */
     if ((double)temp_val > TEMP_THRESHOLD) {
         snprintf(desc, sizeof(desc), "Temperature exceeds %.1f°C", TEMP_THRESHOLD);
         ret = nrf_cloud_alert_send(ALERT_TYPE_TEMPERATURE, temp_val, desc);
@@ -196,7 +220,7 @@ static void check_and_send_alerts(struct sensor_value *temp, struct sensor_value
         }
     }
  
-
+    /* If read value is above the threshold send an alert */
     if ((double)hum_val > HUMID_THRESHOLD) {
         snprintf(desc, sizeof(desc), "Humidity exceeds %.1f%%", HUMID_THRESHOLD);
         ret = nrf_cloud_alert_send(ALERT_TYPE_HUMIDITY, hum_val, desc);
@@ -207,7 +231,7 @@ static void check_and_send_alerts(struct sensor_value *temp, struct sensor_value
         }
     }
 
-
+    /* If read value is above the threshold send an alert */
     if ((double)light_val > LIGHT_THRESHOLD) {
         snprintf(desc, sizeof(desc), "Light exceeds %.1f lux", LIGHT_THRESHOLD);
         ret = nrf_cloud_alert_send(ALERT_TYPE_CUSTOM, light_val, desc);
@@ -218,7 +242,7 @@ static void check_and_send_alerts(struct sensor_value *temp, struct sensor_value
         }
     }
 
-
+    /* If read value is above the threshold send an alert */
     for (int i = 0; i < NUM_CHANNELS; i++) {
         if ((double)adc_voltages[i] > ADC_THRESHOLD) {
             snprintf(desc, sizeof(desc), "ADC%d voltage exceeds %.1fV", i, ADC_THRESHOLD);
@@ -234,6 +258,7 @@ static void check_and_send_alerts(struct sensor_value *temp, struct sensor_value
    
 }
 
+/* Function to print fix data from GNSS */
 static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
 {
     LOG_INF("Latitude:  %.6f", pvt_data->latitude);
@@ -244,16 +269,19 @@ static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
             pvt_data->datetime.seconds, pvt_data->datetime.ms);
 }
 
+/* Experimental sleep mode function using the RTC0, this block of code is where an error is returned for 
+   unrecongized device in device tree */
 static void enter_sleep_mode(void)
 {
     LOG_INF("Entering System OFF mode for %d seconds", SLEEP_DURATION_MS / 1000);
     dk_set_led_off(DK_LED1);
 
-    const struct device *rtc = DEVICE_DT_GET(DT_NODELABEL(rtc1));
+    const struct device *rtc = DEVICE_DT_GET(DT_NODELABEL(rtc0));
     if (!device_is_ready(rtc)) {
         LOG_ERR("RTC not ready, falling back to k_msleep");
         k_msleep(SLEEP_DURATION_MS);
         return;
+
     }
 
     /* Configure RTC alarm for 10 minutes (600 seconds) */
@@ -272,8 +300,10 @@ static void enter_sleep_mode(void)
 
 }
 
+/* Function to read data from sensors */
 static int read_sensors(struct sensor_value *temp, struct sensor_value *hum, struct sensor_value *light)
 {
+    /* Attempt initial fetch for BME280 */
     int err, retries = 3;
     while (retries--) {
         err = sensor_sample_fetch(bme280);
@@ -283,22 +313,25 @@ static int read_sensors(struct sensor_value *temp, struct sensor_value *hum, str
     }
     if (err) return err;
 
+    /* Then retrieve temperature */
     err = sensor_channel_get(bme280, SENSOR_CHAN_AMBIENT_TEMP, temp);
     if (err) {
         LOG_ERR("BME280 temp get failed: %d", err);
         return err;
     }
+    /* Then retrieve humidity */
     err = sensor_channel_get(bme280, SENSOR_CHAN_HUMIDITY, hum);
     if (err) {
         LOG_ERR("BME280 humidity get failed: %d", err);
         return err;
     }
-
+    /* Next fetch from APDS9960 light sensor */
     err = sensor_sample_fetch(apds);
     if (err) {
         LOG_ERR("APDS9960 fetch failed: %d", err);
         return err;
     }
+    /* Rettrieve data from sensor and store in variable */
     err = sensor_channel_get(apds, SENSOR_CHAN_LIGHT, light);
     if (err) {
         LOG_ERR("APDS9960 light get failed: %d", err);
@@ -307,6 +340,7 @@ static int read_sensors(struct sensor_value *temp, struct sensor_value *hum, str
     return 0;
 }
 
+/* Function to send enviromental data to cloud */
 static int send_data_to_cloud(struct sensor_value *temp, struct sensor_value *hum, struct sensor_value *light)
 {
     int ret;
@@ -405,7 +439,7 @@ static int send_data_to_cloud(struct sensor_value *temp, struct sensor_value *hu
     
     return 0;
 }
-
+/* Send GNSS data */
 static int send_gnss_to_cloud(void)
 {
     int ret;
@@ -457,6 +491,7 @@ static int send_gnss_to_cloud(void)
 
     return ret;
 }
+
 
 static void gnss_event_handler(int event)
 {
@@ -523,7 +558,7 @@ static void gnss_event_handler(int event)
     }
    
 }
-
+/* LTE Handler, do not touch, unless to add more cases, this is directly from Nordic */
 static void lte_handler(const struct lte_lc_evt *const evt)
 {
     switch (evt->type) {
@@ -556,6 +591,7 @@ static void lte_handler(const struct lte_lc_evt *const evt)
     }
 }
 
+/* Also do not touch, unless to add more cases */
 static void cloud_event_handler(const struct nrf_cloud_evt *evt)
 {
     if (evt == NULL) {
@@ -588,7 +624,7 @@ static void cloud_event_handler(const struct nrf_cloud_evt *evt)
         break;
     }
 }
-
+/* Initalize Function, calls functions written prior to verify functionality or initilizes libraries */
 static int init(void)
 {
     int err;
