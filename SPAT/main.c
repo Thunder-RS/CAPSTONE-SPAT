@@ -1,6 +1,7 @@
 /* This code is for the Draper Sponsored Capstone Project for 2024-2025 UMass Lowell Academic Year
-   This code is the final incomplete version excluding the RTC experimental code that unfortunately couldn't be finished to replace the function k_msleep or the serial communication 
-   which works in a separate file but was not integrated in time for the SIM card that was used for development had expired. */
+   This code is the final incomplete version excluding the RTC experimental code that unfortunately couldn't be finished to replace the function k_msleep,
+   the flash memeory which faild to partition or the serial communication which works in a separate file but was not integrated in time 
+   for the SIM card that was used for development had expired. */
 
 
 
